@@ -2,7 +2,7 @@
 # AI Node post-install bootstrapper for Ubuntu Server 22.04 / 24.04 / 26.04
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.2.0"
 INSTALL_DIR="/opt/ai-node"
 AGENT_PATH="${INSTALL_DIR}/agent.py"
 VENV_DIR="${INSTALL_DIR}/venv"
@@ -11,6 +11,7 @@ SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 DEFAULT_AGENT_URL="https://raw.githubusercontent.com/thryveapex/ai-agent/main/agent.py"
 
 DRY_RUN=0
+REBOOT_REQUIRED=0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -67,14 +68,17 @@ Options:
   -V, --version   Print script version and exit
 
 Environment:
-  RUN_AS      User that owns the agent process and is added to the docker group
-              (default: SUDO_USER of the installing account)
-  AGENT_URL   URL to download agent.py
-              (default: ${DEFAULT_AGENT_URL})
+  RUN_AS       User that owns the agent process and is added to the docker group
+               (default: SUDO_USER of the installing account)
+  AGENT_URL    URL to download agent.py
+               (default: ${DEFAULT_AGENT_URL})
+  SKIP_NVIDIA  Set to 1 to skip NVIDIA driver installation
+  NO_REBOOT    Set to 1 to skip automatic reboot after new driver install
 
 Example:
   curl -fsSL https://ourapp.ai/install.sh | bash
   RUN_AS=ai-admin sudo -E bash install.sh
+  SKIP_NVIDIA=1 sudo -E bash install.sh
 EOF
 }
 
@@ -146,7 +150,7 @@ require_root() {
 
   if command -v sudo >/dev/null 2>&1; then
     log_info "Re-executing with sudo..."
-    exec sudo --preserve-env=RUN_AS,AGENT_URL,NO_COLOR env bash "$0" "$@"
+    exec sudo --preserve-env=RUN_AS,AGENT_URL,NO_COLOR,SKIP_NVIDIA,NO_REBOOT env bash "$0" "$@"
   fi
 
   die "Root privileges required. Re-run as root or with sudo."
@@ -200,6 +204,90 @@ install_packages() {
   # DEBIAN_FRONTEND avoids interactive prompts on fresh servers
   run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
   log_ok "Packages installed"
+}
+
+has_nvidia_gpu() {
+  if command -v lspci >/dev/null 2>&1; then
+    lspci 2>/dev/null | grep -qi 'nvidia'
+    return $?
+  fi
+  return 1
+}
+
+nvidia_smi_ok() {
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
+}
+
+install_nvidia_drivers() {
+  if [[ "${SKIP_NVIDIA:-0}" == "1" ]]; then
+    log_warn "SKIP_NVIDIA=1; skipping NVIDIA driver installation"
+    return 0
+  fi
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log_info "[dry-run] detect NVIDIA GPU and install drivers via ubuntu-drivers if needed"
+    return 0
+  fi
+
+  # lspci needs pciutils; install lightly before detection
+  if ! command -v lspci >/dev/null 2>&1; then
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y pciutils
+  fi
+
+  if ! has_nvidia_gpu; then
+    log_warn "No NVIDIA GPU detected (lspci). Agent heartbeats need nvidia-smi and will fail without a GPU/drivers."
+    return 0
+  fi
+
+  log_ok "NVIDIA GPU detected"
+
+  if nvidia_smi_ok; then
+    log_ok "nvidia-smi already works; skipping driver install"
+    return 0
+  fi
+
+  log_info "Installing NVIDIA drivers (required for agent heartbeats)..."
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y ubuntu-drivers-common
+
+  # Prefer the Ubuntu recommended driver; fall back to autoinstall.
+  local recommended=""
+  recommended="$(ubuntu-drivers devices 2>/dev/null | awk '/recommended/{print $3; exit}' || true)"
+  if [[ -n "${recommended}" && "${recommended}" == nvidia-driver-* ]]; then
+    log_info "Installing recommended package: ${recommended}"
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${recommended}"
+  else
+    log_info "Running ubuntu-drivers autoinstall..."
+    run env DEBIAN_FRONTEND=noninteractive ubuntu-drivers autoinstall
+  fi
+
+  if nvidia_smi_ok; then
+    log_ok "NVIDIA drivers are active (nvidia-smi OK)"
+    return 0
+  fi
+
+  REBOOT_REQUIRED=1
+  log_warn "NVIDIA drivers installed but nvidia-smi is not active yet (kernel module needs a reboot)"
+}
+
+maybe_reboot() {
+  if [[ "${REBOOT_REQUIRED}" -ne 1 ]]; then
+    return 0
+  fi
+
+  if [[ "${NO_REBOOT:-0}" == "1" ]]; then
+    log_warn "NO_REBOOT=1; reboot manually, then: sudo systemctl restart ${SERVICE_NAME}"
+    return 0
+  fi
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log_info "[dry-run] reboot to load NVIDIA kernel modules"
+    return 0
+  fi
+
+  log_warn "Rebooting in 10 seconds so NVIDIA drivers load and the agent can send heartbeats..."
+  log_warn "Press Ctrl+C to cancel. After reboot the agent service starts automatically."
+  sleep 10
+  systemctl reboot
 }
 
 enable_services() {
@@ -349,12 +437,25 @@ print_summary() {
 
   Next steps:
     1. Re-login (or newgrp docker) so docker group membership applies.
-    2. Ensure NVIDIA drivers are installed so nvidia-smi works (GPU heartbeats).
-    3. Confirm CONTROL_PLANE_URL / MACHINE_ID / AGENT_TOKEN in
+    2. Confirm CONTROL_PLANE_URL / MACHINE_ID / AGENT_TOKEN in
        ${AGENT_PATH} match your control plane (hardcoded in agent.py today).
-    4. Ensure the control plane and local vLLM endpoint are reachable.
+    3. Ensure the control plane and local vLLM endpoint are reachable.
+    4. If NVIDIA drivers were just installed, reboot if the script did not
+       (or set NO_REBOOT=1 and reboot yourself), then verify:
+         nvidia-smi
+         systemctl status ${SERVICE_NAME}
+EOF
+
+  if [[ "${REBOOT_REQUIRED}" -eq 1 && "${NO_REBOOT:-0}" != "1" ]]; then
+    cat <<EOF
+  NOTE: A reboot is required next so nvidia-smi works and heartbeats succeed.
 ============================================================
 EOF
+  else
+    cat <<EOF
+============================================================
+EOF
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -375,6 +476,7 @@ main() {
   resolve_run_as
 
   install_packages
+  install_nvidia_drivers
   enable_services
   prepare_install_dir
   download_agent
@@ -386,6 +488,7 @@ main() {
     log_ok "Dry-run finished; no changes applied"
   else
     print_summary
+    maybe_reboot
   fi
 }
 
