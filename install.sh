@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AI Node post-install bootstrapper for Ubuntu Server 22.04 / 24.04
+# AI Node post-install bootstrapper for Ubuntu Server 22.04 / 24.04 / 26.04
 set -euo pipefail
 
 SCRIPT_VERSION="0.1.0"
@@ -58,7 +58,7 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Bootstrap a private AI node on Ubuntu Server 22.04 or 24.04 after a normal
+Bootstrap a private AI node on Ubuntu Server 22.04, 24.04, or 26.04 after a normal
 Ubuntu install. Installs Docker, Avahi, the agent, and a systemd unit.
 
 Options:
@@ -125,11 +125,11 @@ require_linux_ubuntu() {
   fi
 
   case "${VERSION_ID:-}" in
-    22.04|24.04)
+    22.04|24.04|26.04)
       log_ok "Detected Ubuntu ${VERSION_ID}"
       ;;
     *)
-      die "Unsupported Ubuntu version: ${VERSION_ID:-unknown}. Supported: 22.04, 24.04"
+      die "Unsupported Ubuntu version: ${VERSION_ID:-unknown}. Supported: 22.04, 24.04, 26.04"
       ;;
   esac
 }

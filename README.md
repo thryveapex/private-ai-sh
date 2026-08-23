@@ -1,12 +1,12 @@
 # AI Node Installer
 
-Post-install bootstrapper for private AI nodes. Install Ubuntu Server 22.04 or 24.04 with the normal Ubuntu installer, then run this script to set up Docker, Avahi, the agent, and a systemd service.
+Post-install bootstrapper for private AI nodes. Install Ubuntu Server 22.04, 24.04, or 26.04 with the normal Ubuntu installer, then run this script to set up Docker, Avahi, the agent, and a systemd service.
 
 This replaces the previous custom autoinstall ISO flow. It does **not** build an ISO or configure cloud-init.
 
 ## Prerequisites
 
-- Fresh **Ubuntu Server 22.04 or 24.04** install
+- Fresh **Ubuntu Server 22.04, 24.04, or 26.04** install
 - Root or sudo access
 - Network access (to apt mirrors and GitHub)
 - SSH optional (configure during Ubuntu install if you want remote access)
@@ -48,7 +48,7 @@ bash install.sh --dry-run   # print planned actions; no changes
 
 ## What it does
 
-1. Verifies Linux + Ubuntu 22.04/24.04
+1. Verifies Linux + Ubuntu 22.04/24.04/26.04
 2. Installs: `curl`, `git`, `docker.io`, `docker-compose-v2`, `avahi-daemon`, `python3`, `python3-pip`, `python3-venv`
 3. Enables and starts `docker` and `avahi-daemon`
 4. Creates `/opt/ai-node` and downloads `agent.py`
@@ -91,7 +91,7 @@ make dry-run  # non-destructive install.sh --dry-run
 
 | Symptom | What to try |
 |--------|-------------|
-| Unsupported distro / version | Use Ubuntu Server 22.04 or 24.04 only |
+| Unsupported distro / version | Use Ubuntu Server 22.04, 24.04, or 26.04 only |
 | Agent download fails | Check network / DNS; override with `AGENT_URL` if needed |
 | `ModuleNotFoundError: requests` or `websocket` | Re-run the installer so the venv is created and deps are installed |
 | Service crash loop mentioning `nvidia-smi` | Install NVIDIA drivers; confirm `nvidia-smi` works for the `RUN_AS` user |
