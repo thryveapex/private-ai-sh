@@ -363,7 +363,7 @@ setup_venv() {
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log_info "[dry-run] python3 -m venv ${VENV_DIR}"
-    log_info "[dry-run] ${VENV_DIR}/bin/pip install -U pip requests websocket-client"
+    log_info "[dry-run] ${VENV_DIR}/bin/pip install -U pip requests websocket-client psutil"
     return 0
   fi
 
@@ -373,9 +373,9 @@ setup_venv() {
     log_info "Venv already exists; reusing"
   fi
 
-  "${VENV_DIR}/bin/pip" install -U pip requests websocket-client
+  "${VENV_DIR}/bin/pip" install -U pip requests websocket-client psutil
   chown -R "${RUN_AS}:${RUN_AS}" "${VENV_DIR}"
-  log_ok "Python dependencies installed (requests, websocket-client)"
+  log_ok "Python dependencies installed (requests, websocket-client, psutil)"
 }
 
 add_docker_group() {
