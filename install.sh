@@ -2,16 +2,22 @@
 # AI Node post-install bootstrapper for Ubuntu Server 22.04 / 24.04 / 26.04
 set -euo pipefail
 
-SCRIPT_VERSION="0.2.0"
+SCRIPT_VERSION="0.3.0"
 INSTALL_DIR="/opt/ai-node"
 AGENT_PATH="${INSTALL_DIR}/agent.py"
+CREDENTIALS_PATH="${INSTALL_DIR}/credentials.json"
 VENV_DIR="${INSTALL_DIR}/venv"
 SERVICE_NAME="ai-node.agent.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 DEFAULT_AGENT_URL="https://raw.githubusercontent.com/thryveapex/ai-agent/main/agent.py"
+DEFAULT_CONTROL_PLANE_URL="http://192.168.1.3:3000"
 
 DRY_RUN=0
 REBOOT_REQUIRED=0
+ENROLLMENT_KEY="${ENROLLMENT_KEY:-}"
+CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-${DEFAULT_CONTROL_PLANE_URL}}"
+ENROLLED_MACHINE_ID=""
+ENROLLED_USER_ID=""
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -63,22 +69,27 @@ Bootstrap a private AI node on Ubuntu Server 22.04, 24.04, or 26.04 after a norm
 Ubuntu install. Installs Docker, Avahi, the agent, and a systemd unit.
 
 Options:
-  -h, --help      Show this help and exit
-  -n, --dry-run   Print actions without changing the system
-  -V, --version   Print script version and exit
+  -h, --help                      Show this help and exit
+  -n, --dry-run                   Print actions without changing the system
+  -V, --version                   Print script version and exit
+  --enrollment-key <key>          One-time enrollment key from the dashboard
+  --control-plane-url <url>       Control Plane base URL
+                                  (default: ${DEFAULT_CONTROL_PLANE_URL})
 
 Environment:
-  RUN_AS       User that owns the agent process and is added to the docker group
-               (default: SUDO_USER of the installing account)
-  AGENT_URL    URL to download agent.py
-               (default: ${DEFAULT_AGENT_URL})
-  SKIP_NVIDIA  Set to 1 to skip NVIDIA driver installation
-  NO_REBOOT    Set to 1 to skip automatic reboot after new driver install
+  RUN_AS              User that owns the agent process and is added to the docker group
+                      (default: SUDO_USER of the installing account)
+  AGENT_URL           URL to download agent.py
+                      (default: ${DEFAULT_AGENT_URL})
+  ENROLLMENT_KEY      Same as --enrollment-key
+  CONTROL_PLANE_URL   Same as --control-plane-url
+  SKIP_NVIDIA         Set to 1 to skip NVIDIA driver installation
+  NO_REBOOT           Set to 1 to skip automatic reboot after new driver install
 
 Example:
   curl -fsSL https://ourapp.ai/install.sh | bash
-  RUN_AS=ai-admin sudo -E bash install.sh
-  SKIP_NVIDIA=1 sudo -E bash install.sh
+  RUN_AS=ai-admin sudo -E bash install.sh --enrollment-key ABCDEFGHJK
+  SKIP_NVIDIA=1 sudo -E bash install.sh --enrollment-key ABCDEFGHJK
 EOF
 }
 
@@ -96,6 +107,16 @@ parse_args() {
       -V|--version)
         printf '%s\n' "${SCRIPT_VERSION}"
         exit 0
+        ;;
+      --enrollment-key)
+        [[ $# -ge 2 ]] || die "--enrollment-key requires a value"
+        ENROLLMENT_KEY="$2"
+        shift 2
+        ;;
+      --control-plane-url)
+        [[ $# -ge 2 ]] || die "--control-plane-url requires a value"
+        CONTROL_PLANE_URL="$2"
+        shift 2
         ;;
       *)
         die "Unknown option: $1 (try --help)"
@@ -150,7 +171,7 @@ require_root() {
 
   if command -v sudo >/dev/null 2>&1; then
     log_info "Re-executing with sudo..."
-    exec sudo --preserve-env=RUN_AS,AGENT_URL,NO_COLOR,SKIP_NVIDIA,NO_REBOOT env bash "$0" "$@"
+    exec sudo --preserve-env=RUN_AS,AGENT_URL,NO_COLOR,SKIP_NVIDIA,NO_REBOOT,ENROLLMENT_KEY,CONTROL_PLANE_URL env bash "$0" "$@"
   fi
 
   die "Root privileges required. Re-run as root or with sudo."
@@ -363,6 +384,131 @@ add_docker_group() {
   log_ok "User '${RUN_AS}' is in the docker group (re-login required for new shells)"
 }
 
+resolve_enrollment_key() {
+  if [[ -n "${ENROLLMENT_KEY}" ]]; then
+    return 0
+  fi
+
+  if [[ -t 0 ]]; then
+    printf 'Enter enrollment key: '
+    read -r ENROLLMENT_KEY
+  fi
+
+  if [[ -z "${ENROLLMENT_KEY}" ]]; then
+    die "Enrollment key is required. Pass --enrollment-key <key> or set ENROLLMENT_KEY."
+  fi
+}
+
+detect_gpu_name() {
+  local gpu=""
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+  fi
+  if [[ -z "${gpu}" ]]; then
+    gpu="unknown"
+  fi
+  printf '%s\n' "${gpu}"
+}
+
+enroll_machine() {
+  local hostname
+  local gpu
+  local payload_file
+  local response_file
+  local http_code
+  local body
+  local agent_token
+
+  resolve_enrollment_key
+
+  hostname="$(hostname 2>/dev/null || echo unknown)"
+  gpu="$(detect_gpu_name)"
+
+  log_info "Enrolling machine with Control Plane at ${CONTROL_PLANE_URL}..."
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log_info "[dry-run] POST ${CONTROL_PLANE_URL}/machines/enroll"
+    log_info "[dry-run] write ${CREDENTIALS_PATH}"
+    ENROLLED_MACHINE_ID="dry-run-machine-id"
+    ENROLLED_USER_ID="dry-run-user-id"
+    return 0
+  fi
+
+  payload_file="$(mktemp)"
+  response_file="$(mktemp)"
+
+  ENROLLMENT_KEY="${ENROLLMENT_KEY}" \
+  HOSTNAME_VALUE="${hostname}" \
+  GPU_VALUE="${gpu}" \
+  python3 - <<'PY' >"${payload_file}"
+import json
+import os
+
+print(json.dumps({
+    "enrollment_key": os.environ["ENROLLMENT_KEY"],
+    "hostname": os.environ["HOSTNAME_VALUE"],
+    "hardware": {"gpu": os.environ["GPU_VALUE"]},
+}))
+PY
+
+  http_code="$(
+    curl -sS -o "${response_file}" -w '%{http_code}' \
+      -X POST \
+      -H 'Content-Type: application/json' \
+      -d @"${payload_file}" \
+      "${CONTROL_PLANE_URL}/machines/enroll" || true
+  )"
+  body="$(cat "${response_file}")"
+  rm -f "${payload_file}"
+
+  if [[ "${http_code}" != "200" ]]; then
+    rm -f "${response_file}"
+    die "Machine enrollment failed (HTTP ${http_code}): ${body}"
+  fi
+
+  ENROLLED_MACHINE_ID="$(python3 - <<PY
+import json
+with open("${response_file}", encoding="utf-8") as handle:
+    print(json.load(handle)["machine_id"])
+PY
+)"
+  agent_token="$(python3 - <<PY
+import json
+with open("${response_file}", encoding="utf-8") as handle:
+    print(json.load(handle)["agent_token"])
+PY
+)"
+  ENROLLED_USER_ID="$(python3 - <<PY
+import json
+with open("${response_file}", encoding="utf-8") as handle:
+    print(json.load(handle).get("user_id", ""))
+PY
+)"
+  rm -f "${response_file}"
+
+  CONTROL_PLANE_URL="${CONTROL_PLANE_URL}" \
+  MACHINE_ID_VALUE="${ENROLLED_MACHINE_ID}" \
+  AGENT_TOKEN_VALUE="${agent_token}" \
+  CREDENTIALS_PATH_VALUE="${CREDENTIALS_PATH}" \
+  python3 - <<'PY'
+import json
+import os
+
+credentials = {
+    "control_plane_url": os.environ["CONTROL_PLANE_URL"],
+    "machine_id": os.environ["MACHINE_ID_VALUE"],
+    "agent_token": os.environ["AGENT_TOKEN_VALUE"],
+}
+with open(os.environ["CREDENTIALS_PATH_VALUE"], "w", encoding="utf-8") as handle:
+    json.dump(credentials, handle, indent=2)
+    handle.write("\n")
+PY
+
+  chown "${RUN_AS}:${RUN_AS}" "${CREDENTIALS_PATH}"
+  chmod 600 "${CREDENTIALS_PATH}"
+  log_ok "Machine enrolled (${ENROLLED_MACHINE_ID}); credentials written to ${CREDENTIALS_PATH}"
+}
+
 write_systemd_unit() {
   log_info "Writing ${SERVICE_PATH}..."
 
@@ -428,8 +574,12 @@ print_summary() {
   LAN IP:       ${ip}
   Install dir:  ${INSTALL_DIR}
   Agent:        ${AGENT_PATH}
+  Credentials:  ${CREDENTIALS_PATH}
   Service:      ${SERVICE_NAME}
   Run as:       ${RUN_AS}
+  Control Plane:${CONTROL_PLANE_URL}
+  Machine ID:   ${ENROLLED_MACHINE_ID:-unknown}
+  User ID:      ${ENROLLED_USER_ID:-unknown}
 
   Check status:
     systemctl status ${SERVICE_NAME}
@@ -437,8 +587,7 @@ print_summary() {
 
   Next steps:
     1. Re-login (or newgrp docker) so docker group membership applies.
-    2. Confirm CONTROL_PLANE_URL / MACHINE_ID / AGENT_TOKEN in
-       ${AGENT_PATH} match your control plane (hardcoded in agent.py today).
+    2. Confirm the machine appears in your dashboard for this user.
     3. Ensure the control plane and local vLLM endpoint are reachable.
     4. If NVIDIA drivers were just installed, reboot if the script did not
        (or set NO_REBOOT=1 and reboot yourself), then verify:
@@ -482,6 +631,7 @@ main() {
   download_agent
   setup_venv
   add_docker_group
+  enroll_machine
   write_systemd_unit
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
