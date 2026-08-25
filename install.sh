@@ -2,7 +2,7 @@
 # AI Node post-install bootstrapper for Ubuntu Server 22.04 / 24.04 / 26.04
 set -euo pipefail
 
-SCRIPT_VERSION="0.4.0"
+SCRIPT_VERSION="0.5.0"
 INSTALL_DIR="/opt/ai-node"
 AGENT_PATH="${INSTALL_DIR}/agent.py"
 CREDENTIALS_PATH="${INSTALL_DIR}/credentials.json"
@@ -496,6 +496,34 @@ add_docker_group() {
   log_ok "User '${RUN_AS}' is in the docker group (re-login required for new shells)"
 }
 
+configure_power_sudoers() {
+  # Allow agent user to reboot/poweroff without a password (dashboard Restart/Shutdown).
+  local sudoers_file="/etc/sudoers.d/ai-node-power"
+  local systemctl_path
+
+  log_info "Configuring passwordless reboot/poweroff for '${RUN_AS}'..."
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log_info "[dry-run] write ${sudoers_file}"
+    return 0
+  fi
+
+  systemctl_path="$(command -v systemctl || echo /usr/bin/systemctl)"
+
+  cat >"${sudoers_file}" <<EOF
+# Managed by AI Node install.sh — remote Restart / Shutdown from dashboard
+${RUN_AS} ALL=(root) NOPASSWD: ${systemctl_path} reboot, ${systemctl_path} poweroff
+EOF
+  chmod 440 "${sudoers_file}"
+
+  if ! visudo -cf "${sudoers_file}" >/dev/null 2>&1; then
+    rm -f "${sudoers_file}"
+    die "Invalid sudoers file generated for power actions"
+  fi
+
+  log_ok "Sudoers installed at ${sudoers_file}"
+}
+
 resolve_enrollment_key() {
   if [[ -n "${ENROLLMENT_KEY}" ]]; then
     return 0
@@ -744,6 +772,7 @@ main() {
   download_agent
   setup_venv
   add_docker_group
+  configure_power_sudoers
   enroll_machine
   write_systemd_unit
 
