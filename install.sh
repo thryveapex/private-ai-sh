@@ -295,7 +295,37 @@ docker_nvidia_runtime_ok() {
   if ! command -v docker >/dev/null 2>&1; then
     return 1
   fi
-  docker info 2>/dev/null | grep -qi 'Runtimes:.*nvidia'
+  docker info 2>/dev/null | grep -qiE 'Runtimes:.*\bnvidia\b|Default Runtime: nvidia'
+}
+
+write_docker_nvidia_daemon_json() {
+  # Fallback when nvidia-ctk does not create /etc/docker/daemon.json
+  local daemon_json="/etc/docker/daemon.json"
+  local runtime_path
+
+  runtime_path="$(command -v nvidia-container-runtime || true)"
+  if [[ -z "${runtime_path}" ]]; then
+    runtime_path="nvidia-container-runtime"
+  fi
+
+  mkdir -p /etc/docker
+  if [[ -f "${daemon_json}" ]]; then
+    # Merge carefully: if file exists but has no nvidia runtime, replace with known-good minimal config
+    # after backing up (nvidia-ctk should normally own this file).
+    cp -a "${daemon_json}" "${daemon_json}.bak.$(date +%s)"
+  fi
+
+  cat >"${daemon_json}" <<EOF
+{
+  "runtimes": {
+    "nvidia": {
+      "path": "${runtime_path}",
+      "runtimeArgs": []
+    }
+  }
+}
+EOF
+  log_ok "Wrote ${daemon_json} with nvidia runtime (${runtime_path})"
 }
 
 install_nvidia_container_toolkit() {
@@ -348,17 +378,27 @@ install_nvidia_container_toolkit() {
     die "nvidia-ctk not found after installing nvidia-container-toolkit"
   fi
 
-  log_info "Configuring Docker to use the NVIDIA runtime..."
-  run nvidia-ctk runtime configure --runtime=docker
-  run systemctl restart docker
+  if ! command -v nvidia-container-runtime >/dev/null 2>&1; then
+    die "nvidia-container-runtime not found; toolkit install looks incomplete"
+  fi
 
-  # Give docker a moment after restart
+  log_info "Configuring Docker to use the NVIDIA runtime..."
+  # --set-as-default ensures --gpus works even when CDI discovery is flaky
+  run nvidia-ctk runtime configure --runtime=docker --set-as-default
+  run systemctl restart docker
   sleep 2
+
+  if ! docker_nvidia_runtime_ok; then
+    log_warn "nvidia-ctk configure did not register runtime; writing daemon.json fallback"
+    write_docker_nvidia_daemon_json
+    run systemctl restart docker
+    sleep 2
+  fi
 
   if docker_nvidia_runtime_ok; then
     log_ok "Docker GPU runtime configured (nvidia)"
   else
-    log_warn "NVIDIA toolkit installed; verify with: docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi"
+    die "Docker still has no nvidia runtime. Check: docker info | grep -i runtime; cat /etc/docker/daemon.json"
   fi
 }
 
