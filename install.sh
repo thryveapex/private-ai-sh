@@ -2,7 +2,7 @@
 # AI Node post-install bootstrapper for Ubuntu Server 22.04 / 24.04 / 26.04
 set -euo pipefail
 
-SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION="0.4.0"
 INSTALL_DIR="/opt/ai-node"
 AGENT_PATH="${INSTALL_DIR}/agent.py"
 CREDENTIALS_PATH="${INSTALL_DIR}/credentials.json"
@@ -83,7 +83,7 @@ Environment:
                       (default: ${DEFAULT_AGENT_URL})
   ENROLLMENT_KEY      Same as --enrollment-key
   CONTROL_PLANE_URL   Same as --control-plane-url
-  SKIP_NVIDIA         Set to 1 to skip NVIDIA driver installation
+  SKIP_NVIDIA         Set to 1 to skip NVIDIA driver and container toolkit installation
   NO_REBOOT           Set to 1 to skip automatic reboot after new driver install
 
 Example:
@@ -288,6 +288,78 @@ install_nvidia_drivers() {
 
   REBOOT_REQUIRED=1
   log_warn "NVIDIA drivers installed but nvidia-smi is not active yet (kernel module needs a reboot)"
+}
+
+docker_nvidia_runtime_ok() {
+  # True when Docker can see the nvidia runtime (toolkit configured).
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+  docker info 2>/dev/null | grep -qi 'Runtimes:.*nvidia'
+}
+
+install_nvidia_container_toolkit() {
+  # Required for: docker run --gpus all ...
+  # Host nvidia-smi alone is not enough for GPU containers (vLLM).
+  if [[ "${SKIP_NVIDIA:-0}" == "1" ]]; then
+    log_warn "SKIP_NVIDIA=1; skipping NVIDIA Container Toolkit"
+    return 0
+  fi
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log_info "[dry-run] install nvidia-container-toolkit and configure Docker GPU runtime"
+    return 0
+  fi
+
+  if ! command -v lspci >/dev/null 2>&1; then
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y pciutils
+  fi
+
+  if ! has_nvidia_gpu; then
+    log_warn "No NVIDIA GPU detected; skipping NVIDIA Container Toolkit"
+    return 0
+  fi
+
+  if docker_nvidia_runtime_ok && dpkg -s nvidia-container-toolkit >/dev/null 2>&1; then
+    log_ok "NVIDIA Container Toolkit already configured for Docker"
+    return 0
+  fi
+
+  log_info "Installing NVIDIA Container Toolkit (required for docker --gpus)..."
+
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y curl gnupg ca-certificates
+
+  local keyring="/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+  local list_file="/etc/apt/sources.list.d/nvidia-container-toolkit.list"
+
+  if [[ ! -f "${keyring}" ]]; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      | gpg --dearmor -o "${keyring}"
+  fi
+
+  curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed "s#deb https://#deb [signed-by=${keyring}] https://#g" \
+    > "${list_file}"
+
+  run apt-get update -y
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit
+
+  if ! command -v nvidia-ctk >/dev/null 2>&1; then
+    die "nvidia-ctk not found after installing nvidia-container-toolkit"
+  fi
+
+  log_info "Configuring Docker to use the NVIDIA runtime..."
+  run nvidia-ctk runtime configure --runtime=docker
+  run systemctl restart docker
+
+  # Give docker a moment after restart
+  sleep 2
+
+  if docker_nvidia_runtime_ok; then
+    log_ok "Docker GPU runtime configured (nvidia)"
+  else
+    log_warn "NVIDIA toolkit installed; verify with: docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi"
+  fi
 }
 
 maybe_reboot() {
@@ -627,6 +699,7 @@ main() {
   install_packages
   install_nvidia_drivers
   enable_services
+  install_nvidia_container_toolkit
   prepare_install_dir
   download_agent
   setup_venv

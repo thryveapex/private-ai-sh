@@ -10,7 +10,7 @@ This replaces the previous custom autoinstall ISO flow. It does **not** build an
 - Root or sudo access
 - Network access (to apt mirrors and GitHub)
 - SSH optional (configure during Ubuntu install if you want remote access)
-- **GPU nodes:** an NVIDIA GPU. The installer detects it and installs drivers automatically (a reboot is usually required once).
+- **GPU nodes:** an NVIDIA GPU. The installer detects it and installs NVIDIA drivers **and** the NVIDIA Container Toolkit (so `docker run --gpus all` works for vLLM). A reboot is usually required once after first-time driver install.
 
 ## Install
 
@@ -30,7 +30,7 @@ sudo bash install.sh
 |----------|-------------|
 | `RUN_AS` | User that runs the agent and is added to the `docker` group. Defaults to `$SUDO_USER`. |
 | `AGENT_URL` | URL for `agent.py`. Defaults to the public raw GitHub URL for `thryveapex/ai-agent`. |
-| `SKIP_NVIDIA` | Set to `1` to skip NVIDIA driver installation. |
+| `SKIP_NVIDIA` | Set to `1` to skip NVIDIA driver and container toolkit installation. |
 | `NO_REBOOT` | Set to `1` to skip the automatic reboot after a new driver install. |
 
 Examples:
@@ -56,11 +56,13 @@ bash install.sh --dry-run   # print planned actions; no changes
 2. Installs: `curl`, `git`, `docker.io`, `docker-compose-v2`, `avahi-daemon`, `python3`, `python3-pip`, `python3-venv`
 3. Detects an NVIDIA GPU and installs the recommended NVIDIA drivers (unless `SKIP_NVIDIA=1`)
 4. Enables and starts `docker` and `avahi-daemon`
-5. Creates `/opt/ai-node` and downloads `agent.py`
-6. Creates `/opt/ai-node/venv` and installs `requests` + `websocket-client`
-7. Adds the install user to the `docker` group
-8. Installs and starts `ai-node.agent.service`
-9. Reboots automatically if drivers were newly installed and `nvidia-smi` is not active yet (unless `NO_REBOOT=1`)
+5. Installs **NVIDIA Container Toolkit** and configures Docker GPU runtime (`docker run --gpus all`)
+6. Creates `/opt/ai-node` and downloads `agent.py`
+7. Creates `/opt/ai-node/venv` and installs Python deps
+8. Adds the install user to the `docker` group
+9. Enrolls with the control plane (when `--enrollment-key` is provided)
+10. Installs and starts `ai-node.agent.service`
+11. Reboots automatically if drivers were newly installed and `nvidia-smi` is not active yet (unless `NO_REBOOT=1`)
 
 After reboot, the agent service starts on its own and can send GPU heartbeats once `nvidia-smi` works.
 
@@ -103,6 +105,7 @@ make dry-run  # non-destructive install.sh --dry-run
 | Agent download fails | Check network / DNS; override with `AGENT_URL` if needed |
 | `ModuleNotFoundError: requests` or `websocket` | Re-run the installer so the venv is created and deps are installed |
 | Service crash loop mentioning `nvidia-smi` | Re-run the installer (it installs NVIDIA drivers), reboot if needed, then confirm `nvidia-smi` works |
+| `could not select device driver "" with capabilities: [[gpu]]` | NVIDIA Container Toolkit missing; re-run installer (v0.4.0+) or install toolkit manually |
 | Installer rebooted the machine | Expected after a first-time NVIDIA driver install; after boot check `nvidia-smi` and `systemctl status ai-node.agent.service` |
 | Want to skip drivers / reboot | `SKIP_NVIDIA=1` or `NO_REBOOT=1` |
 | Control plane / heartbeat errors | Verify URL and token in `/opt/ai-node/agent.py` and that the control plane is reachable |
