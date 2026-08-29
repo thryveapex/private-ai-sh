@@ -435,7 +435,7 @@ enable_services() {
 
 prepare_install_dir() {
   log_info "Ensuring ${INSTALL_DIR} exists..."
-  run mkdir -p "${INSTALL_DIR}"
+  run mkdir -p "${INSTALL_DIR}" "${INSTALL_DIR}/hf-cache"
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     chown "${RUN_AS}:${RUN_AS}" "${INSTALL_DIR}"
   else
