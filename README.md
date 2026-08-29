@@ -30,7 +30,8 @@ sudo bash install.sh
 |----------|-------------|
 | `RUN_AS` | User that runs the agent and is added to the `docker` group. Defaults to `$SUDO_USER`. |
 | `AGENT_URL` | URL for `agent.py`. Defaults to the public raw GitHub URL for `thryveapex/ai-agent`. |
-| `SKIP_NVIDIA` | Set to `1` to skip NVIDIA driver and container toolkit installation. |
+| `SKIP_NVIDIA` | Set to `1` to skip NVIDIA driver and container toolkit installation. Use for **CPU-only nodes** — the agent still enrolls and reports RAM telemetry; the Model Library only offers CPU runtime installs. |
+| `SKIP_DISK_EXPAND` | Set to `1` to skip growing the root LVM volume to use all disk space (default: expand on install). |
 | `NO_REBOOT` | Set to `1` to skip the automatic reboot after a new driver install. |
 
 Examples:
@@ -54,17 +55,22 @@ bash install.sh --dry-run   # print planned actions; no changes
 
 1. Verifies Linux + Ubuntu 22.04/24.04/26.04
 2. Installs: `curl`, `git`, `docker.io`, `docker-compose-v2`, `avahi-daemon`, `python3`, `python3-pip`, `python3-venv`
-3. Detects an NVIDIA GPU and installs the recommended NVIDIA drivers (unless `SKIP_NVIDIA=1`)
-4. Enables and starts `docker` and `avahi-daemon`
-5. Installs **NVIDIA Container Toolkit** and configures Docker GPU runtime (`docker run --gpus all`)
-6. Creates `/opt/ai-node` and downloads `agent.py`
-7. Creates `/opt/ai-node/venv` and installs Python deps
-8. Adds the install user to the `docker` group
-9. Enrolls with the control plane (when `--enrollment-key` is provided)
-10. Installs and starts `ai-node.agent.service`
-11. Reboots automatically if drivers were newly installed and `nvidia-smi` is not active yet (unless `NO_REBOOT=1`)
+3. **Expands root LVM** to use all free space on the disk (fixes Ubuntu’s default ~100 GB `/` on large NVMe drives)
+4. Detects an NVIDIA GPU and installs the recommended NVIDIA drivers (unless `SKIP_NVIDIA=1`)
+5. Enables and starts `docker` and `avahi-daemon`
+6. Installs **NVIDIA Container Toolkit** and configures Docker GPU runtime (`docker run --gpus all`)
+7. Creates `/opt/ai-node` and downloads `agent.py`
+8. Creates `/opt/ai-node/venv` and installs Python deps
+9. Adds the install user to the `docker` group
+10. Enrolls with the control plane (when `--enrollment-key` is provided)
+11. Installs and starts `ai-node.agent.service`
+12. Reboots automatically if drivers were newly installed and `nvidia-smi` is not active yet (unless `NO_REBOOT=1`)
 
 After reboot, the agent service starts on its own and can send GPU heartbeats once `nvidia-smi` works.
+
+### CPU-only nodes
+
+Set `SKIP_NVIDIA=1` during install on machines without an NVIDIA GPU. The node enrolls normally and sends CPU/RAM/storage telemetry (no `gpus` in heartbeat). In the Model Library, only the **CPU** runtime is available; installs use the vLLM CPU container image (`vllm/vllm-openai-cpu:latest-x86_64`).
 
 ## Re-run
 

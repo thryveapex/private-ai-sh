@@ -2,7 +2,7 @@
 # AI Node post-install bootstrapper for Ubuntu Server 22.04 / 24.04 / 26.04
 set -euo pipefail
 
-SCRIPT_VERSION="0.5.0"
+SCRIPT_VERSION="0.5.1"
 INSTALL_DIR="/opt/ai-node"
 AGENT_PATH="${INSTALL_DIR}/agent.py"
 CREDENTIALS_PATH="${INSTALL_DIR}/credentials.json"
@@ -84,6 +84,7 @@ Environment:
   ENROLLMENT_KEY      Same as --enrollment-key
   CONTROL_PLANE_URL   Same as --control-plane-url
   SKIP_NVIDIA         Set to 1 to skip NVIDIA driver and container toolkit installation
+  SKIP_DISK_EXPAND    Set to 1 to skip expanding root LVM to use all disk space
   NO_REBOOT           Set to 1 to skip automatic reboot after new driver install
 
 Example:
@@ -171,7 +172,7 @@ require_root() {
 
   if command -v sudo >/dev/null 2>&1; then
     log_info "Re-executing with sudo..."
-    exec sudo --preserve-env=RUN_AS,AGENT_URL,NO_COLOR,SKIP_NVIDIA,NO_REBOOT,ENROLLMENT_KEY,CONTROL_PLANE_URL env bash "$0" "$@"
+    exec sudo --preserve-env=RUN_AS,AGENT_URL,NO_COLOR,SKIP_NVIDIA,SKIP_DISK_EXPAND,NO_REBOOT,ENROLLMENT_KEY,CONTROL_PLANE_URL env bash "$0" "$@"
   fi
 
   die "Root privileges required. Re-run as root or with sudo."
@@ -225,6 +226,73 @@ install_packages() {
   # DEBIAN_FRONTEND avoids interactive prompts on fresh servers
   run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
   log_ok "Packages installed"
+}
+
+# Ubuntu Server often installs with a ~100 GB root LV on a much larger NVMe.
+# Grow / to consume all free extents in the root volume group.
+expand_root_lvm() {
+  if [[ "${SKIP_DISK_EXPAND:-0}" == "1" ]]; then
+    log_info "Skipping root filesystem expansion (SKIP_DISK_EXPAND=1)"
+    return 0
+  fi
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log_info "[dry-run] Would expand root LVM to use all free volume-group space"
+    return 0
+  fi
+
+  local root_source root_type lv_path vg_name free_extents
+  root_source="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+  root_type="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+
+  if [[ -z "${root_source}" ]]; then
+    log_warn "Could not detect root mount source; skipping disk expansion"
+    return 0
+  fi
+
+  if [[ "${root_source}" != /dev/mapper/* ]]; then
+    log_info "Root is not on LVM (${root_source}); skipping disk expansion"
+    return 0
+  fi
+
+  if ! command -v lvextend >/dev/null 2>&1; then
+    log_info "Installing lvm2 for root volume expansion..."
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y lvm2
+  fi
+
+  lv_path="${root_source}"
+  vg_name="$(lvs --noheadings -o vg_name "${lv_path}" 2>/dev/null | tr -d ' ' || true)"
+  if [[ -z "${vg_name}" ]]; then
+    log_warn "Could not resolve volume group for ${lv_path}; skipping disk expansion"
+    return 0
+  fi
+
+  free_extents="$(vgs --noheadings -o vg_free_count "${vg_name}" 2>/dev/null | tr -d ' ' || true)"
+  if [[ -z "${free_extents}" || "${free_extents}" == "0" ]]; then
+    log_info "No free LVM space to allocate to root (${lv_path})"
+    return 0
+  fi
+
+  log_info "Expanding ${lv_path} to use all free space in volume group ${vg_name}..."
+  if ! run lvextend -l +100%FREE "${lv_path}"; then
+    log_warn "lvextend failed; root may stay at current size"
+    return 0
+  fi
+
+  case "${root_type}" in
+    ext4)
+      run resize2fs "${lv_path}"
+      ;;
+    xfs)
+      run xfs_growfs /
+      ;;
+    *)
+      log_warn "Unsupported root filesystem type '${root_type}'; grow manually"
+      return 0
+      ;;
+  esac
+
+  log_ok "Root filesystem expanded ($(df -h / | awk 'NR==2 {print $2 " total, " $4 " free"}'))"
 }
 
 has_nvidia_gpu() {
@@ -765,6 +833,7 @@ main() {
   resolve_run_as
 
   install_packages
+  expand_root_lvm
   install_nvidia_drivers
   enable_services
   install_nvidia_container_toolkit
