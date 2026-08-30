@@ -611,6 +611,9 @@ detect_gpu_name() {
   local gpu=""
   if command -v nvidia-smi >/dev/null 2>&1; then
     gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+    if [[ "${gpu}" == *"NVIDIA-SMI"* ]] || [[ "${gpu}" == *"failed"* ]] || [[ "${gpu}" == *"couldn't communicate"* ]]; then
+      gpu=""
+    fi
   fi
   if [[ -z "${gpu}" ]]; then
     gpu="unknown"
